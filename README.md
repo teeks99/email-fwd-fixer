@@ -53,7 +53,7 @@ sequenceDiagram
 
 # Setup and Execution (Docker)
 
-This project runs inside a Docker container using `docker compose`.
+This project runs inside a Docker container using `docker compose`. By default, it will pull the pre-built `latest` image from DockerHub (`teeks99/email-fwd-fixer:latest`). If you wish to use a specific version, you can edit the `image:` tag in `docker-compose.yml` to target a specific release (e.g., `teeks99/email-fwd-fixer:v1.0.0`).
 
 ## 1. Configure the Environment & Passwords
 

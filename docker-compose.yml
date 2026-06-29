@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   email-fixer:
-    build: .
+    image: teeks99/email-fwd-fixer:latest
     container_name: email-fixer
     restart: unless-stopped
     env_file:
