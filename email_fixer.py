@@ -5,6 +5,7 @@ import time
 import logging
 import signal
 import sys
+import datetime
 from threading import Event
 from dotenv import load_dotenv
 
@@ -128,7 +129,7 @@ def copy_to_notify(raw_email):
         except:
             pass
 
-def process_passthrough_emails():
+def process_passthrough_emails(stats):
     passthrough = connect_imap(
         os.getenv("PASSTHROUGH_IMAP_SERVER"),
         os.getenv("PASSTHROUGH_IMAP_PORT", 993),
@@ -150,7 +151,7 @@ def process_passthrough_emails():
         if not msg_nums:
             return
             
-        logger.info(f"Found {len(msg_nums)} messages in PassThrough")
+        logger.debug(f"Found {len(msg_nums)} messages in PassThrough")
         
         for num in msg_nums:
             # Fetch the raw message
@@ -162,10 +163,14 @@ def process_passthrough_emails():
             raw_email = data[0][1]
             message_id = extract_message_id(raw_email)
             
-            logger.info(f"Processing message ID: {message_id}")
+            logger.debug(f"Processing message ID: {message_id}")
+            print('.', end='', flush=True)
+            stats['checked'] += 1
             
             if not message_id:
-                logger.warning(f"Could not extract Message-ID from message {num}. Copying to Notify to be safe.")
+                logger.warning(f"\nCould not extract Message-ID from message {num}. Copying to Notify to be safe.")
+                print("\nMessage (no ID) not found in GMail. Sent to notifier.", flush=True)
+                stats['notified'] += 1
                 copy_to_notify(raw_email)
                 passthrough.store(num, '+FLAGS', '\\Deleted')
                 continue
@@ -176,14 +181,16 @@ def process_passthrough_emails():
             found_in_gmail = check_gmail_for_message(message_id)
             
             if found_in_gmail:
-                logger.info(f"Message {message_id} found in GMail.")
+                logger.debug(f"Message {message_id} found in GMail.")
             else:
-                logger.info(f"Message {message_id} NOT found in GMail. Copying to Notify...")
+                logger.debug(f"Message {message_id} NOT found in GMail. Copying to Notify...")
+                print(f"\nMessage {message_id} not found in GMail. Sent to notifier.", flush=True)
+                stats['notified'] += 1
                 copy_to_notify(raw_email)
                 
             # Delete from PassThrough
             passthrough.store(num, '+FLAGS', '\\Deleted')
-            logger.info(f"Marked message {num} for deletion in PassThrough.")
+            logger.debug(f"Marked message {num} for deletion in PassThrough.")
             
         # Expunge deleted messages
         passthrough.expunge()
@@ -207,9 +214,19 @@ def main():
     
     logger.info("Starting Email Forward Fixer Service...")
     
+    current_date = datetime.date.today()
+    stats = {'checked': 0, 'notified': 0}
+    
     while not shutdown_event.is_set():
+        today = datetime.date.today()
+        if today > current_date:
+            print() # Ensure the summary starts on a new line if dots were printed
+            logger.info(f"Daily Summary: {stats['checked']} messages checked, {stats['notified']} notified.")
+            stats = {'checked': 0, 'notified': 0}
+            current_date = today
+            
         try:
-            process_passthrough_emails()
+            process_passthrough_emails(stats)
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
             
