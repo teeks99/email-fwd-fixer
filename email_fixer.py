@@ -3,7 +3,16 @@ import email
 import os
 import time
 import logging
+import signal
+import sys
+from threading import Event
 from dotenv import load_dotenv
+
+shutdown_event = Event()
+
+def handle_shutdown(signum, frame):
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_event.set()
 
 # Set up logging
 logging.basicConfig(
@@ -12,11 +21,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def connect_imap(server, port, user, password, readonly=False):
+def connect_imap(server, port, user, password, folder='INBOX', readonly=False):
     try:
         mail = imaplib.IMAP4_SSL(server, port)
         mail.login(user, password)
-        mail.select('INBOX', readonly=readonly)
+        if folder:
+            mail.select(folder, readonly=readonly)
         return mail
     except Exception as e:
         logger.error(f"Failed to connect to IMAP {user}@{server}: {e}")
@@ -25,6 +35,26 @@ def connect_imap(server, port, user, password, readonly=False):
 def extract_message_id(raw_email):
     msg = email.message_from_bytes(raw_email)
     return msg.get('Message-ID', '').strip()
+
+def get_all_mail_folder(mail):
+    try:
+        status, folders = mail.list()
+        if status == 'OK':
+            import re
+            for folder_bytes in folders:
+                folder_str = folder_bytes.decode('utf-8', errors='ignore')
+                if '\\all' in folder_str.lower():
+                    # The folder name is at the end of the LIST response
+                    # Try to extract it if it's quoted
+                    match = re.search(r'"([^"]+)"$', folder_str)
+                    if match:
+                        return f'"{match.group(1)}"'
+                    # Fallback if unquoted
+                    return folder_str.split()[-1]
+    except Exception as e:
+        logger.error(f"Error querying folder list: {e}")
+        
+    return '"[Gmail]/All Mail"'
 
 def check_gmail_for_message(message_id):
     if not message_id:
@@ -35,16 +65,31 @@ def check_gmail_for_message(message_id):
         os.getenv("GMAIL_IMAP_PORT", 993),
         os.getenv("GMAIL_IMAP_USER"),
         os.getenv("GMAIL_IMAP_PASS"),
-        readonly=True
+        folder=None
     )
     
     if not gmail:
         return False
         
     try:
-        # Search by Message-ID
-        search_query = f'(HEADER Message-ID "{message_id}")'
-        status, response = gmail.search(None, search_query)
+        # Dynamically find the All Mail folder regardless of language
+        target_folder = get_all_mail_folder(gmail)
+        
+        status, response = gmail.select(target_folder, readonly=True)
+        
+        if status != 'OK':
+            logger.warning(f"Could not select All Mail folder ({target_folder}). Response: {response}. Falling back to INBOX.")
+            gmail.select('INBOX', readonly=True)
+        
+        # Search by Message-ID safely using imaplib's native argument quoting
+        status, response = gmail.search(None, 'HEADER', 'Message-ID', message_id)
+        if status == 'OK':
+            msg_ids = response[0].split()
+            if len(msg_ids) > 0:
+                return True
+                
+        # Fallback to Gmail's native search engine (X-GM-RAW) just in case
+        status, response = gmail.search(None, 'X-GM-RAW', f'rfc822msgid:{message_id}')
         if status == 'OK':
             msg_ids = response[0].split()
             return len(msg_ids) > 0
@@ -119,6 +164,15 @@ def process_passthrough_emails():
             
             logger.info(f"Processing message ID: {message_id}")
             
+            if not message_id:
+                logger.warning(f"Could not extract Message-ID from message {num}. Copying to Notify to be safe.")
+                copy_to_notify(raw_email)
+                passthrough.store(num, '+FLAGS', '\\Deleted')
+                continue
+            
+            # Add a small delay to give Gmail time to process and index the incoming message
+            time.sleep(5)
+            
             found_in_gmail = check_gmail_for_message(message_id)
             
             if found_in_gmail:
@@ -146,17 +200,21 @@ def process_passthrough_emails():
 def main():
     load_dotenv()
     
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    
     check_interval = int(os.getenv("CHECK_INTERVAL_SECONDS", 300))
     
     logger.info("Starting Email Forward Fixer Service...")
     
-    while True:
+    while not shutdown_event.is_set():
         try:
             process_passthrough_emails()
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
             
-        time.sleep(check_interval)
+        # Wait for the interval, but wake up immediately if shutdown is requested
+        shutdown_event.wait(check_interval)
 
 if __name__ == "__main__":
     main()

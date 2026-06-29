@@ -1,0 +1,7 @@
+services:
+  email-fixer:
+    image: teeks99/email-fwd-fixer:latest
+    container_name: email-fixer
+    restart: unless-stopped
+    env_file:
+      - .env
