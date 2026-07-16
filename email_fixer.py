@@ -35,7 +35,14 @@ def connect_imap(server, port, user, password, folder='INBOX', readonly=False):
 
 def extract_message_id(raw_email):
     msg = email.message_from_bytes(raw_email)
-    return msg.get('Message-ID', '').strip()
+    msg_id = msg.get('Message-ID', '')
+    # Sanitize to prevent IMAP/Log injection
+    if msg_id:
+        msg_id = msg_id.replace('\r', '').replace('\n', '').strip()
+        # Cap length to prevent excessively long IDs
+        if len(msg_id) > 255:
+            msg_id = msg_id[:255]
+    return msg_id
 
 def get_folders_to_check(mail):
     all_mail = '"[Gmail]/All Mail"'
@@ -176,14 +183,14 @@ def process_passthrough_emails(stats):
         logger.debug(f"Found {len(msg_nums)} messages in PassThrough")
         
         for num in msg_nums:
-            # Fetch the raw message
-            status, data = passthrough.fetch(num, '(RFC822)')
+            # Fetch only the headers to extract Message-ID, preventing memory exhaustion (DoS) from large emails
+            status, data = passthrough.fetch(num, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
             if status != 'OK':
-                logger.error(f"Failed to fetch message {num}")
+                logger.error(f"Failed to fetch header for message {num}")
                 continue
                 
-            raw_email = data[0][1]
-            message_id = extract_message_id(raw_email)
+            header_data = data[0][1]
+            message_id = extract_message_id(header_data)
             
             logger.debug(f"Processing message ID: {message_id}")
             print('.', end='', flush=True)
@@ -193,7 +200,12 @@ def process_passthrough_emails(stats):
                 logger.warning(f"\nCould not extract Message-ID from message {num}. Copying to Notify to be safe.")
                 print("\nMessage (no ID) not found in GMail. Sent to notifier.", flush=True)
                 stats['notified'] += 1
-                copy_to_notify(raw_email)
+                
+                # Fetch the full email only when we need to copy it
+                full_status, full_data = passthrough.fetch(num, '(RFC822)')
+                if full_status == 'OK':
+                    copy_to_notify(full_data[0][1])
+                    
                 passthrough.store(num, '+FLAGS', '\\Deleted')
                 continue
             
@@ -208,7 +220,11 @@ def process_passthrough_emails(stats):
                 logger.debug(f"Message {message_id} NOT found in GMail. Copying to Notify...")
                 print(f"\nMessage {message_id} not found in GMail. Sent to notifier.", flush=True)
                 stats['notified'] += 1
-                copy_to_notify(raw_email)
+                
+                # Fetch the full email only because we need to copy it
+                full_status, full_data = passthrough.fetch(num, '(RFC822)')
+                if full_status == 'OK':
+                    copy_to_notify(full_data[0][1])
                 
             # Delete from PassThrough
             passthrough.store(num, '+FLAGS', '\\Deleted')
