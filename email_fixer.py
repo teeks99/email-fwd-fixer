@@ -212,6 +212,13 @@ def process_passthrough_emails(stats):
             # Add a small delay to give Gmail time to process and index the incoming message
             time.sleep(5)
             
+            # Send a keep-alive ping to PassThrough to prevent the server from dropping the connection
+            try:
+                passthrough.noop()
+            except Exception:
+                pass
+
+            
             found_in_gmail = check_gmail_for_message(message_id)
             
             if found_in_gmail:
