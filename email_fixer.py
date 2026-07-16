@@ -37,25 +37,39 @@ def extract_message_id(raw_email):
     msg = email.message_from_bytes(raw_email)
     return msg.get('Message-ID', '').strip()
 
-def get_all_mail_folder(mail):
+def get_folders_to_check(mail):
+    all_mail = '"[Gmail]/All Mail"'
+    spam = '"[Gmail]/Spam"'
+    trash = '"[Gmail]/Trash"'
+    
     try:
         status, folders = mail.list()
         if status == 'OK':
             import re
             for folder_bytes in folders:
                 folder_str = folder_bytes.decode('utf-8', errors='ignore')
-                if '\\all' in folder_str.lower():
+                folder_lower = folder_str.lower()
+                
+                if '\\all' in folder_lower or '\\junk' in folder_lower or '\\spam' in folder_lower or '\\trash' in folder_lower:
                     # The folder name is at the end of the LIST response
                     # Try to extract it if it's quoted
                     match = re.search(r'"([^"]+)"$', folder_str)
                     if match:
-                        return f'"{match.group(1)}"'
-                    # Fallback if unquoted
-                    return folder_str.split()[-1]
+                        folder_name = f'"{match.group(1)}"'
+                    else:
+                        # Fallback if unquoted
+                        folder_name = folder_str.split()[-1]
+                        
+                    if '\\all' in folder_lower:
+                        all_mail = folder_name
+                    elif '\\junk' in folder_lower or '\\spam' in folder_lower:
+                        spam = folder_name
+                    elif '\\trash' in folder_lower:
+                        trash = folder_name
     except Exception as e:
         logger.error(f"Error querying folder list: {e}")
         
-    return '"[Gmail]/All Mail"'
+    return [all_mail, spam, trash]
 
 def check_gmail_for_message(message_id):
     if not message_id:
@@ -73,27 +87,35 @@ def check_gmail_for_message(message_id):
         return False
         
     try:
-        # Dynamically find the All Mail folder regardless of language
-        target_folder = get_all_mail_folder(gmail)
+        # Dynamically find the special folders regardless of language
+        folders_to_check = get_folders_to_check(gmail)
         
-        status, response = gmail.select(target_folder, readonly=True)
-        
-        if status != 'OK':
-            logger.warning(f"Could not select All Mail folder ({target_folder}). Response: {response}. Falling back to INBOX.")
-            gmail.select('INBOX', readonly=True)
-        
-        # Search by Message-ID safely using imaplib's native argument quoting
-        status, response = gmail.search(None, 'HEADER', 'Message-ID', message_id)
-        if status == 'OK':
-            msg_ids = response[0].split()
-            if len(msg_ids) > 0:
-                return True
-                
-        # Fallback to Gmail's native search engine (X-GM-RAW) just in case
-        status, response = gmail.search(None, 'X-GM-RAW', f'rfc822msgid:{message_id}')
-        if status == 'OK':
-            msg_ids = response[0].split()
-            return len(msg_ids) > 0
+        for target_folder in folders_to_check:
+            status, response = gmail.select(target_folder, readonly=True)
+            
+            if status != 'OK':
+                logger.debug(f"Could not select folder ({target_folder}). Response: {response}.")
+                if target_folder == folders_to_check[0]:
+                    logger.warning(f"Could not select All Mail folder ({target_folder}). Falling back to INBOX.")
+                    status, response = gmail.select('INBOX', readonly=True)
+                    if status != 'OK':
+                        continue
+                else:
+                    continue
+            
+            # Search by Message-ID safely using imaplib's native argument quoting
+            status, response = gmail.search(None, 'HEADER', 'Message-ID', message_id)
+            if status == 'OK':
+                msg_ids = response[0].split()
+                if len(msg_ids) > 0:
+                    return True
+                    
+            # Fallback to Gmail's native search engine (X-GM-RAW) just in case
+            status, response = gmail.search(None, 'X-GM-RAW', f'rfc822msgid:{message_id}')
+            if status == 'OK':
+                msg_ids = response[0].split()
+                if len(msg_ids) > 0:
+                    return True
     except Exception as e:
         logger.error(f"Error searching GMail for {message_id}: {e}")
     finally:
