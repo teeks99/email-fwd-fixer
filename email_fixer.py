@@ -212,7 +212,7 @@ def main():
     
     check_interval = int(os.getenv("CHECK_INTERVAL_SECONDS", 300))
     
-    logger.info("Starting Email Forward Fixer Service...")
+    logger.info("Starting Email Forward Fixer Service")
     
     current_date = datetime.date.today()
     stats = {'checked': 0, 'notified': 0}
