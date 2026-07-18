@@ -63,6 +63,7 @@ This project runs inside a Docker container using `docker compose`. By default, 
    ```
 2. Open `.env` and fill in your IMAP credentials for the PassThrough, Notify, and GMail accounts. 
    - Note: For GMail, you must use an **App Password** (see subsection below).
+3. (Optional) Set `COPY_TO_GMAIL_INBOX=true` if you want emails that are missed to also be copied directly to your Gmail Inbox. This operation uses the safe IMAP `APPEND` command, eliminating the risk of mailbox corruption or data loss.
 
 ### Generating a GMail App Password
 
