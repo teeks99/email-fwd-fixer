@@ -1,5 +1,6 @@
 import imaplib
 import email
+from email.header import decode_header, make_header
 import os
 import time
 import logging
@@ -175,14 +176,34 @@ class IMAPClient:
             self.mail = None
             self.current_folder = None
 
-def extract_message_id(raw_email: bytes) -> str:
+def decode_header_value(header_val: Optional[str]) -> str:
+    if not header_val:
+        return ""
+    try:
+        decoded_str = str(make_header(decode_header(header_val)))
+    except Exception:
+        decoded_str = str(header_val)
+    return re.sub(r'\s+', ' ', decoded_str).strip()
+
+def extract_message_details(raw_email: bytes) -> Dict[str, str]:
     msg = email.message_from_bytes(raw_email)
     msg_id = msg.get('Message-ID', '')
     if msg_id:
         msg_id = msg_id.replace('\r', '').replace('\n', '').strip()
         if len(msg_id) > 255:
             msg_id = msg_id[:255]
-    return msg_id
+            
+    sender = decode_header_value(msg.get('From', ''))
+    subject = decode_header_value(msg.get('Subject', ''))
+    
+    return {
+        'message_id': msg_id,
+        'sender': sender or 'Unknown Sender',
+        'subject': subject or 'No Subject'
+    }
+
+def extract_message_id(raw_email: bytes) -> str:
+    return extract_message_details(raw_email)['message_id']
 
 def get_folders_to_check(gmail: IMAPClient) -> List[str]:
     if getattr(gmail, '_folders_to_check', None):
@@ -275,21 +296,24 @@ def process_single_message(
     stats: Dict[str, int], 
     config: Config
 ) -> None:
-    status, data = passthrough.execute('fetch', num, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+    status, data = passthrough.execute('fetch', num, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])')
     if status != 'OK' or not data or not data[0]:
         logger.error(f"Failed to fetch header for message {num.decode('utf-8')}")
         return
         
     header_data = data[0][1]
-    message_id = extract_message_id(header_data)
+    details = extract_message_details(header_data)
+    message_id = details['message_id']
+    sender = details['sender']
+    subject = details['subject']
     
     logger.debug(f"Processing message ID: {message_id}")
     print('.', end='', flush=True)
     stats['checked'] += 1
     
     if not message_id:
-        logger.warning(f"\nCould not extract Message-ID from message {num.decode('utf-8')}. Copying to Notify to be safe.")
-        print("\nMessage (no ID) not found in GMail. Sent to notifier.", flush=True)
+        logger.warning(f"\nCould not extract Message-ID from message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
+        print(f"\nMessage (no ID) not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
         stats['notified'] += 1
         
         full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
@@ -313,8 +337,8 @@ def process_single_message(
     if found_in_gmail:
         logger.debug(f"Message {message_id} found in GMail.")
     else:
-        logger.debug(f"Message {message_id} NOT found in GMail. Copying to Notify...")
-        print(f"\nMessage {message_id} not found in GMail. Sent to notifier.", flush=True)
+        logger.info(f"Message {message_id} NOT found in GMail (From: {sender}, Subject: {subject}). Copying to Notify...")
+        print(f"\nMessage {message_id} not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
         stats['notified'] += 1
         
         full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
