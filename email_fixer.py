@@ -312,8 +312,9 @@ def process_single_message(
     stats['checked'] += 1
     
     if not message_id:
-        logger.warning(f"\nCould not extract Message-ID from message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
-        print(f"\nMessage (no ID) not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
+        logger.warning(f"Could not extract Message-ID from message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n{now} - Message (no ID) not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
         stats['notified'] += 1
         
         full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
@@ -338,7 +339,8 @@ def process_single_message(
         logger.debug(f"Message {message_id} found in GMail.")
     else:
         logger.info(f"Message {message_id} NOT found in GMail (From: {sender}, Subject: {subject}). Copying to Notify...")
-        print(f"\nMessage {message_id} not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n{now} - Message {message_id} not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
         stats['notified'] += 1
         
         full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
