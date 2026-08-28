@@ -21,7 +21,8 @@ def handle_shutdown(signum: int, frame: Any) -> None:
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
@@ -312,9 +313,8 @@ def process_single_message(
     stats['checked'] += 1
     
     if not message_id:
+        print(flush=True)
         logger.warning(f"Could not extract Message-ID from message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
-        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"\n{now} - Message (no ID) not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
         stats['notified'] += 1
         
         full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
@@ -338,9 +338,8 @@ def process_single_message(
     if found_in_gmail:
         logger.debug(f"Message {message_id} found in GMail.")
     else:
+        print(flush=True)
         logger.info(f"Message {message_id} NOT found in GMail (From: {sender}, Subject: {subject}). Copying to Notify...")
-        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"\n{now} - Message {message_id} not found in GMail (From: {sender}, Subject: {subject}). Sent to notifier.", flush=True)
         stats['notified'] += 1
         
         full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
@@ -377,6 +376,7 @@ def process_passthrough_emails(stats: Dict[str, int], config: Config) -> None:
                             process_single_message(passthrough, gmail, notify_mail, num, stats, config)
                         except Exception as e:
                             logger.error(f"Error processing message {num.decode('utf-8', errors='ignore')}: {e}")
+                    print(flush=True)
                             
                     try:
                         passthrough.execute('expunge')

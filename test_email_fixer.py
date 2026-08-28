@@ -36,11 +36,9 @@ class TestEmailFixer(unittest.TestCase):
         self.assertEqual(details['subject'], "No Subject")
         self.assertEqual(extract_message_id(raw_email), "")
 
-    def test_process_single_message_not_found_timestamp(self):
+    def test_process_single_message_not_found_logging(self):
         from unittest.mock import MagicMock, patch
-        import io
-        import re
-        from email_fixer import process_single_message, Config
+        from email_fixer import process_single_message, Config, logger
 
         mock_passthrough = MagicMock()
         mock_passthrough.execute.side_effect = [
@@ -56,12 +54,9 @@ class TestEmailFixer(unittest.TestCase):
 
         with patch('email_fixer.check_gmail_for_message', return_value=False), \
              patch('email_fixer.time.sleep'), \
-             patch('sys.stdout', new=io.StringIO()) as fake_out:
+             self.assertLogs(logger, level='INFO') as log_cm:
             process_single_message(mock_passthrough, mock_gmail, mock_notify, b'1', stats, config)
-            output = fake_out.getvalue()
-            # Verify timestamp matches YYYY-MM-DD HH:MM:SS format before message
-            pattern = r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - Message <test1234@example.com> not found in GMail'
-            self.assertRegex(output, pattern)
+            self.assertTrue(any("Message <test1234@example.com> NOT found in GMail" in msg for msg in log_cm.output))
 
 if __name__ == "__main__":
     unittest.main()
