@@ -289,6 +289,34 @@ def copy_to_imap(mail_client: Optional[IMAPClient], raw_email: bytes, folder: st
         logger.error(f"Error copying message: {e}")
         return False
 
+def backup_message(
+    passthrough: IMAPClient,
+    gmail: Optional[IMAPClient],
+    notify_mail: Optional[IMAPClient],
+    num: bytes,
+    config: Config
+) -> bool:
+    """Copy a PassThrough message into Notify (and optionally the GMail Inbox).
+
+    Returns True only once the Notify copy is confirmed, so the caller knows
+    whether it is safe to delete the original from PassThrough."""
+    full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
+    if full_status != 'OK' or not full_data or not full_data[0]:
+        logger.error(f"Failed to fetch full message {num.decode('utf-8')} from PassThrough.")
+        return False
+
+    raw_email = full_data[0][1]
+    if not copy_to_imap(notify_mail, raw_email):
+        logger.error(f"Failed to copy message {num.decode('utf-8')} to Notify.")
+        return False
+
+    if config.copy_to_gmail_inbox:
+        logger.debug(f"Also copying message {num.decode('utf-8')} to GMail Inbox...")
+        if not copy_to_imap(gmail, raw_email):
+            logger.warning(f"Failed to copy message {num.decode('utf-8')} to the GMail Inbox (it is backed up in Notify).")
+
+    return True
+
 def process_single_message(
     passthrough: IMAPClient, 
     gmail: Optional[IMAPClient], 
@@ -315,14 +343,12 @@ def process_single_message(
     if not message_id:
         print(flush=True)
         logger.warning(f"Could not extract Message-ID from message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
+
+        if not backup_message(passthrough, gmail, notify_mail, num, config):
+            logger.error(f"Could not back up message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Leaving it in PassThrough to retry.")
+            return
+
         stats['notified'] += 1
-        
-        full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
-        if full_status == 'OK' and full_data and full_data[0]:
-            copy_to_imap(notify_mail, full_data[0][1])
-            if config.copy_to_gmail_inbox:
-                copy_to_imap(gmail, full_data[0][1])
-            
         passthrough.execute('store', num, '+FLAGS', '\\Deleted')
         return
     
@@ -340,15 +366,13 @@ def process_single_message(
     else:
         print(flush=True)
         logger.info(f"Message {message_id} NOT found in GMail (From: {sender}, Subject: {subject}). Copying to Notify...")
+
+        if not backup_message(passthrough, gmail, notify_mail, num, config):
+            logger.error(f"Could not back up message {message_id} (From: {sender}, Subject: {subject}). Leaving it in PassThrough to retry.")
+            return
+
         stats['notified'] += 1
-        
-        full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
-        if full_status == 'OK' and full_data and full_data[0]:
-            copy_to_imap(notify_mail, full_data[0][1])
-            if config.copy_to_gmail_inbox:
-                logger.debug(f"Also copying message {message_id} to GMail Inbox...")
-                copy_to_imap(gmail, full_data[0][1])
-        
+
     passthrough.execute('store', num, '+FLAGS', '\\Deleted')
     logger.debug(f"Marked message {num.decode('utf-8')} for deletion in PassThrough.")
 
