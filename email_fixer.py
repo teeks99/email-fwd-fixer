@@ -86,7 +86,10 @@ class IMAPClient:
         self.close()
 
     def connect(self) -> bool:
-        self.close()
+        # Tear the old session down without expunging. IMAP CLOSE purges every
+        # message already flagged \Deleted from a writable mailbox, and a
+        # reconnect can land part way through a run of deletions.
+        self.close(expunge=False)
         if not self.server or not self.user:
             return False
         try:
@@ -145,7 +148,10 @@ class IMAPClient:
             return 'NO', [b'Failed to select folder']
 
     def execute(self, func_name: str, *args, **kwargs) -> Any:
-        """Execute an imaplib method with automatic reconnect on connection or state errors."""
+        """Execute an imaplib method with automatic reconnect on connection or state errors.
+
+        The reconnect drops the old session without expunging, so a command that
+        fails mid-pass never destroys messages flagged earlier in that pass."""
         if not self.is_connected():
             if not self.connect():
                 raise Exception(f"Not connected to IMAP server {self.user}@{self.server}")
@@ -163,13 +169,19 @@ class IMAPClient:
             else:
                 raise
 
-    def close(self) -> None:
+    def close(self, expunge: bool = True) -> None:
+        """Tear down the connection.
+
+        IMAP CLOSE permanently removes every \\Deleted message from a writable
+        mailbox, so callers that are only swapping out a stale socket must pass
+        expunge=False. LOGOUT on its own never expunges."""
         if self.mail:
-            try:
-                if getattr(self.mail, 'state', None) == 'SELECTED':
-                    self.mail.close()
-            except Exception:
-                pass
+            if expunge:
+                try:
+                    if getattr(self.mail, 'state', None) == 'SELECTED':
+                        self.mail.close()
+                except Exception:
+                    pass
             try:
                 self.mail.logout()
             except Exception:
@@ -293,27 +305,27 @@ def backup_message(
     passthrough: IMAPClient,
     gmail: Optional[IMAPClient],
     notify_mail: Optional[IMAPClient],
-    num: bytes,
+    uid: bytes,
     config: Config
 ) -> bool:
     """Copy a PassThrough message into Notify (and optionally the GMail Inbox).
 
     Returns True only once the Notify copy is confirmed, so the caller knows
     whether it is safe to delete the original from PassThrough."""
-    full_status, full_data = passthrough.execute('fetch', num, '(RFC822)')
+    full_status, full_data = passthrough.execute('uid', 'FETCH', uid, '(RFC822)')
     if full_status != 'OK' or not full_data or not full_data[0]:
-        logger.error(f"Failed to fetch full message {num.decode('utf-8')} from PassThrough.")
+        logger.error(f"Failed to fetch full message UID {uid.decode('utf-8')} from PassThrough.")
         return False
 
     raw_email = full_data[0][1]
     if not copy_to_imap(notify_mail, raw_email):
-        logger.error(f"Failed to copy message {num.decode('utf-8')} to Notify.")
+        logger.error(f"Failed to copy message UID {uid.decode('utf-8')} to Notify.")
         return False
 
     if config.copy_to_gmail_inbox:
-        logger.debug(f"Also copying message {num.decode('utf-8')} to GMail Inbox...")
+        logger.debug(f"Also copying message UID {uid.decode('utf-8')} to GMail Inbox...")
         if not copy_to_imap(gmail, raw_email):
-            logger.warning(f"Failed to copy message {num.decode('utf-8')} to the GMail Inbox (it is backed up in Notify).")
+            logger.warning(f"Failed to copy message UID {uid.decode('utf-8')} to the GMail Inbox (it is backed up in Notify).")
 
     return True
 
@@ -321,13 +333,13 @@ def process_single_message(
     passthrough: IMAPClient, 
     gmail: Optional[IMAPClient], 
     notify_mail: Optional[IMAPClient], 
-    num: bytes, 
+    uid: bytes, 
     stats: Dict[str, int], 
     config: Config
 ) -> None:
-    status, data = passthrough.execute('fetch', num, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])')
+    status, data = passthrough.execute('uid', 'FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])')
     if status != 'OK' or not data or not data[0]:
-        logger.error(f"Failed to fetch header for message {num.decode('utf-8')}")
+        logger.error(f"Failed to fetch header for message UID {uid.decode('utf-8')}")
         return
         
     header_data = data[0][1]
@@ -342,14 +354,14 @@ def process_single_message(
     
     if not message_id:
         print(flush=True)
-        logger.warning(f"Could not extract Message-ID from message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
+        logger.warning(f"Could not extract Message-ID from message UID {uid.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
 
-        if not backup_message(passthrough, gmail, notify_mail, num, config):
-            logger.error(f"Could not back up message {num.decode('utf-8')} (From: {sender}, Subject: {subject}). Leaving it in PassThrough to retry.")
+        if not backup_message(passthrough, gmail, notify_mail, uid, config):
+            logger.error(f"Could not back up message UID {uid.decode('utf-8')} (From: {sender}, Subject: {subject}). Leaving it in PassThrough to retry.")
             return
 
         stats['notified'] += 1
-        passthrough.execute('store', num, '+FLAGS', '\\Deleted')
+        passthrough.execute('uid', 'STORE', uid, '+FLAGS', '\\Deleted')
         return
     
     time.sleep(5)
@@ -367,14 +379,14 @@ def process_single_message(
         print(flush=True)
         logger.info(f"Message {message_id} NOT found in GMail (From: {sender}, Subject: {subject}). Copying to Notify...")
 
-        if not backup_message(passthrough, gmail, notify_mail, num, config):
+        if not backup_message(passthrough, gmail, notify_mail, uid, config):
             logger.error(f"Could not back up message {message_id} (From: {sender}, Subject: {subject}). Leaving it in PassThrough to retry.")
             return
 
         stats['notified'] += 1
 
-    passthrough.execute('store', num, '+FLAGS', '\\Deleted')
-    logger.debug(f"Marked message {num.decode('utf-8')} for deletion in PassThrough.")
+    passthrough.execute('uid', 'STORE', uid, '+FLAGS', '\\Deleted')
+    logger.debug(f"Marked message UID {uid.decode('utf-8')} for deletion in PassThrough.")
 
 def process_passthrough_emails(stats: Dict[str, int], config: Config) -> None:
     with IMAPClient(config.passthrough_server, config.passthrough_port, config.passthrough_user, config.passthrough_pass, folder='INBOX') as passthrough:
@@ -382,24 +394,27 @@ def process_passthrough_emails(stats: Dict[str, int], config: Config) -> None:
             return
             
         try:
-            status, response = passthrough.execute('search', None, 'ALL')
+            # Address messages by UID throughout: sequence numbers shift down
+            # whenever the mailbox is expunged, so a mid-loop expunge would leave
+            # the identifiers still queued here pointing at the wrong messages.
+            status, response = passthrough.execute('uid', 'SEARCH', None, 'ALL')
             if status != 'OK':
                 logger.error("Failed to search PassThrough INBOX")
                 return
                 
-            msg_nums = response[0].split()
-            if not msg_nums:
+            msg_uids = response[0].split()
+            if not msg_uids:
                 return
                 
-            logger.debug(f"Found {len(msg_nums)} messages in PassThrough")
+            logger.debug(f"Found {len(msg_uids)} messages in PassThrough")
             
             with IMAPClient(config.gmail_server, config.gmail_port, config.gmail_user, config.gmail_pass, folder=None) as gmail:
                 with IMAPClient(config.notify_server, config.notify_port, config.notify_user, config.notify_pass, folder='INBOX') as notify_mail:
-                    for num in msg_nums:
+                    for uid in msg_uids:
                         try:
-                            process_single_message(passthrough, gmail, notify_mail, num, stats, config)
+                            process_single_message(passthrough, gmail, notify_mail, uid, stats, config)
                         except Exception as e:
-                            logger.error(f"Error processing message {num.decode('utf-8', errors='ignore')}: {e}")
+                            logger.error(f"Error processing message UID {uid.decode('utf-8', errors='ignore')}: {e}")
                     print(flush=True)
                             
                     try:

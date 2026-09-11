@@ -54,7 +54,7 @@ class TestEmailFixer(unittest.TestCase):
     @staticmethod
     def deleted(mock_passthrough):
         return any(
-            call.args[0] == 'store' and '\\Deleted' in call.args
+            call.args[:2] == ('uid', 'STORE') and '\\Deleted' in call.args
             for call in mock_passthrough.execute.call_args_list
         )
 
@@ -165,6 +165,96 @@ class TestEmailFixer(unittest.TestCase):
 
         self.assertTrue(self.deleted(mock_passthrough))
         self.assertEqual(stats['notified'], 1)
+
+    def test_passthrough_addresses_messages_by_uid(self):
+        from unittest.mock import MagicMock
+
+        mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID)
+        mock_notify = MagicMock()
+        mock_notify.execute.return_value = ('OK', [b''])
+        self.run_process(mock_passthrough, mock_notify)
+
+        calls = [call.args for call in mock_passthrough.execute.call_args_list]
+        self.assertIn(('uid', 'FETCH', b'1', '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])'), calls)
+        self.assertIn(('uid', 'FETCH', b'1', '(RFC822)'), calls)
+        self.assertIn(('uid', 'STORE', b'1', '+FLAGS', '\\Deleted'), calls)
+        # Nothing may address a message by sequence number, which shifts on expunge.
+        self.assertEqual([], [c for c in calls if c[0] in ('fetch', 'store', 'search')])
+
+    def test_process_passthrough_emails_searches_by_uid(self):
+        from unittest.mock import MagicMock, patch
+        from email_fixer import process_passthrough_emails, Config
+
+        passthrough = MagicMock()
+        passthrough.is_connected.return_value = True
+        passthrough.execute.return_value = ('OK', [b''])
+        config = Config(300, False, "imap.test", 993, "u", "p", "", 993, "", "", "", 993, "", "")
+
+        with patch('email_fixer.IMAPClient') as mock_cls:
+            mock_cls.return_value.__enter__.return_value = passthrough
+            process_passthrough_emails({'checked': 0, 'notified': 0}, config)
+
+        passthrough.execute.assert_called_once_with('uid', 'SEARCH', None, 'ALL')
+
+    @staticmethod
+    def stale_and_fresh():
+        from unittest.mock import MagicMock
+
+        stale = MagicMock()
+        stale.state = 'SELECTED'
+        fresh = MagicMock()
+        fresh.state = 'SELECTED'
+        fresh.select.return_value = ('OK', [b'1'])
+        return stale, fresh
+
+    def test_reconnect_logs_out_without_expunging(self):
+        from unittest.mock import patch
+        from email_fixer import IMAPClient
+
+        stale, fresh = self.stale_and_fresh()
+        with patch('email_fixer.imaplib.IMAP4_SSL', return_value=fresh):
+            client = IMAPClient('imap.test', 993, 'u', 'p', folder='INBOX')
+            client.mail = stale
+            client.current_folder = 'INBOX'
+            self.assertTrue(client.connect())
+
+        # IMAP CLOSE would purge every message already flagged \Deleted this pass.
+        stale.close.assert_not_called()
+        stale.logout.assert_called_once()
+        self.assertIs(client.mail, fresh)
+
+    def test_execute_reconnect_after_imap_error_does_not_expunge(self):
+        import imaplib
+        from unittest.mock import patch
+        from email_fixer import IMAPClient
+
+        stale, fresh = self.stale_and_fresh()
+        # A NO/BAD reply leaves the socket alive, so CLOSE here really would expunge.
+        stale.noop.side_effect = imaplib.IMAP4.error('BAD stale session')
+        fresh.noop.return_value = ('OK', [b'NOOP completed'])
+
+        with patch('email_fixer.imaplib.IMAP4_SSL', return_value=fresh):
+            client = IMAPClient('imap.test', 993, 'u', 'p', folder='INBOX')
+            client.mail = stale
+            client.current_folder = 'INBOX'
+            self.assertEqual(client.execute('noop'), ('OK', [b'NOOP completed']))
+
+        stale.close.assert_not_called()
+        self.assertEqual('INBOX', client.current_folder)
+
+    def test_close_still_expunges_on_normal_teardown(self):
+        from unittest.mock import MagicMock
+        from email_fixer import IMAPClient
+
+        mail = MagicMock()
+        mail.state = 'SELECTED'
+        client = IMAPClient('imap.test', 993, 'u', 'p', folder='INBOX')
+        client.mail = mail
+        client.close()
+
+        mail.close.assert_called_once()
+        mail.logout.assert_called_once()
+        self.assertIsNone(client.mail)
 
 if __name__ == "__main__":
     unittest.main()
