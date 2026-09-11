@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 
 shutdown_event = Event()
 
+# How long to let a forward settle before asking GMail whether it arrived. The
+# forward and the GMail delivery race, so looking too early reports mail that is
+# merely still in flight as missing.
+GMAIL_SETTLE_SECONDS = 5
+
 def handle_shutdown(signum: int, frame: Any) -> None:
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     shutdown_event.set()
@@ -217,225 +222,320 @@ def extract_message_details(raw_email: bytes) -> Dict[str, str]:
 
 def extract_message_id(raw_email: bytes) -> str:
     return extract_message_details(raw_email)['message_id']
+@dataclass
+class Message:
+    """One PassThrough message, identified by a UID rather than a sequence number.
 
-def get_folders_to_check(gmail: IMAPClient) -> List[str]:
-    if getattr(gmail, '_folders_to_check', None):
-        return gmail._folders_to_check
+    Sequence numbers are positional and shift down whenever the mailbox is
+    expunged; a UID stays bound to this message for the life of the mailbox."""
+    uid: bytes
+    message_id: str
+    sender: str
+    subject: str
 
-    all_mail = '"[Gmail]/All Mail"'
-    spam = '"[Gmail]/Spam"'
-    trash = '"[Gmail]/Trash"'
-    
-    try:
-        status, folders = gmail.execute('list')
-        if status == 'OK' and folders:
-            for folder_bytes in folders:
-                if not folder_bytes:
-                    continue
-                folder_str = folder_bytes.decode('utf-8', errors='ignore') if isinstance(folder_bytes, bytes) else str(folder_bytes)
-                folder_lower = folder_str.lower()
-                
-                if '\\all' in folder_lower or '\\junk' in folder_lower or '\\spam' in folder_lower or '\\trash' in folder_lower:
-                    match = re.search(r'"([^"]+)"$', folder_str)
-                    if match:
-                        folder_name = f'"{match.group(1)}"'
-                    else:
-                        folder_name = folder_str.split()[-1]
-                        
-                    if '\\all' in folder_lower:
-                        all_mail = folder_name
-                    elif '\\junk' in folder_lower or '\\spam' in folder_lower:
-                        spam = folder_name
-                    elif '\\trash' in folder_lower:
-                        trash = folder_name
-    except Exception as e:
-        logger.error(f"Error querying folder list: {e}")
-        
-    result = [all_mail, spam, trash]
-    gmail._folders_to_check = result
-    return result
+    @property
+    def uid_str(self) -> str:
+        return self.uid.decode('utf-8', errors='ignore')
 
-def check_gmail_for_message(gmail: Optional[IMAPClient], message_id: str) -> bool:
-    if not message_id or not gmail or not gmail.is_connected():
-        return False
-        
-    try:
-        folders_to_check = get_folders_to_check(gmail)
-        
-        for target_folder in folders_to_check:
-            status, response = gmail.select(target_folder, readonly=True)
-            
-            if status != 'OK':
-                logger.debug(f"Could not select folder ({target_folder}). Response: {response}.")
-                if target_folder == folders_to_check[0]:
-                    logger.warning(f"Could not select All Mail folder ({target_folder}). Falling back to INBOX.")
-                    status, response = gmail.select('INBOX', readonly=True)
-                    if status != 'OK':
-                        continue
-                else:
-                    continue
-            
-            status, response = gmail.execute('search', None, 'HEADER', 'Message-ID', message_id)
-            if status == 'OK' and response and response[0]:
-                msg_ids = response[0].split()
-                if len(msg_ids) > 0:
-                    return True
-                    
-            status, response = gmail.execute('search', None, 'X-GM-RAW', f'rfc822msgid:{message_id}')
-            if status == 'OK' and response and response[0]:
-                msg_ids = response[0].split()
-                if len(msg_ids) > 0:
-                    return True
-    except Exception as e:
-        logger.error(f"Error searching GMail for {message_id}: {e}")
-            
-    return False
+    def __str__(self) -> str:
+        return f"UID {self.uid_str} (From: {self.sender}, Subject: {self.subject})"
 
-def copy_to_imap(mail_client: Optional[IMAPClient], raw_email: bytes, folder: str = 'INBOX') -> bool:
-    if not mail_client or not mail_client.is_connected():
-        return False
-    try:
-        status, response = mail_client.execute('append', folder, None, imaplib.Time2Internaldate(time.time()), raw_email)
-        return status == 'OK'
-    except Exception as e:
-        logger.error(f"Error copying message: {e}")
-        return False
+class ForwardFixer:
+    """Drains the PassThrough mailbox, losing nothing on the way.
 
-def backup_message(
-    passthrough: IMAPClient,
-    gmail: Optional[IMAPClient],
-    notify_mail: Optional[IMAPClient],
-    uid: bytes,
-    config: Config
-) -> bool:
-    """Copy a PassThrough message into Notify (and optionally the GMail Inbox).
+    PassThrough receives forwarded mail that GMail sometimes drops silently. For
+    each message the fixer answers one question -- is this message safe to remove
+    from PassThrough? -- and there is exactly one answer that permits removal:
 
-    Returns True only once the Notify copy is confirmed, so the caller knows
-    whether it is safe to delete the original from PassThrough."""
-    full_status, full_data = passthrough.execute('uid', 'FETCH', uid, '(RFC822)')
-    if full_status != 'OK' or not full_data or not full_data[0]:
-        logger.error(f"Failed to fetch full message UID {uid.decode('utf-8')} from PassThrough.")
-        return False
+      * GMail is confirmed to already hold it, or
+      * Notify is confirmed to hold a copy.
 
-    raw_email = full_data[0][1]
-    if not copy_to_imap(notify_mail, raw_email):
-        logger.error(f"Failed to copy message UID {uid.decode('utf-8')} to Notify.")
-        return False
+    Anything else leaves the message where it is, to be retried next pass.
 
-    if config.copy_to_gmail_inbox:
-        logger.debug(f"Also copying message UID {uid.decode('utf-8')} to GMail Inbox...")
-        if not copy_to_imap(gmail, raw_email):
-            logger.warning(f"Failed to copy message UID {uid.decode('utf-8')} to the GMail Inbox (it is backed up in Notify).")
+    Three mailboxes are involved and only one of them is ever deleted from:
 
-    return True
+      PassThrough  INBOX, writable  -- searched, fetched, flagged, expunged
+      GMail        readonly         -- searched; appended to only if configured
+      Notify       INBOX            -- appended to; never flagged or deleted
+    """
 
-def process_single_message(
-    passthrough: IMAPClient, 
-    gmail: Optional[IMAPClient], 
-    notify_mail: Optional[IMAPClient], 
-    uid: bytes, 
-    stats: Dict[str, int], 
-    config: Config
-) -> None:
-    status, data = passthrough.execute('uid', 'FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])')
-    if status != 'OK' or not data or not data[0]:
-        logger.error(f"Failed to fetch header for message UID {uid.decode('utf-8')}")
-        return
-        
-    header_data = data[0][1]
-    details = extract_message_details(header_data)
-    message_id = details['message_id']
-    sender = details['sender']
-    subject = details['subject']
-    
-    logger.debug(f"Processing message ID: {message_id}")
-    print('.', end='', flush=True)
-    stats['checked'] += 1
-    
-    if not message_id:
-        print(flush=True)
-        logger.warning(f"Could not extract Message-ID from message UID {uid.decode('utf-8')} (From: {sender}, Subject: {subject}). Copying to Notify to be safe.")
+    def __init__(self, config: Config, stats: Dict[str, int]):
+        self.config = config
+        self.stats = stats
+        self.passthrough: Optional[IMAPClient] = None
+        self.gmail: Optional[IMAPClient] = None
+        self.notify: Optional[IMAPClient] = None
+        self._gmail_folder_cache: Optional[List[str]] = None
 
-        if not backup_message(passthrough, gmail, notify_mail, uid, config):
-            logger.error(f"Could not back up message UID {uid.decode('utf-8')} (From: {sender}, Subject: {subject}). Leaving it in PassThrough to retry.")
-            return
+    # -- the policy ---------------------------------------------------------
 
-        stats['notified'] += 1
-        passthrough.execute('uid', 'STORE', uid, '+FLAGS', '\\Deleted')
-        return
-    
-    time.sleep(5)
-    
-    try:
-        passthrough.execute('noop')
-    except Exception:
-        pass
+    def run_once(self) -> None:
+        """One poll cycle over the PassThrough INBOX.
 
-    found_in_gmail = check_gmail_for_message(gmail, message_id)
-    
-    if found_in_gmail:
-        logger.debug(f"Message {message_id} found in GMail.")
-    else:
-        print(flush=True)
-        logger.info(f"Message {message_id} NOT found in GMail (From: {sender}, Subject: {subject}). Copying to Notify...")
-
-        if not backup_message(passthrough, gmail, notify_mail, uid, config):
-            logger.error(f"Could not back up message {message_id} (From: {sender}, Subject: {subject}). Leaving it in PassThrough to retry.")
-            return
-
-        stats['notified'] += 1
-
-    passthrough.execute('uid', 'STORE', uid, '+FLAGS', '\\Deleted')
-    logger.debug(f"Marked message UID {uid.decode('utf-8')} for deletion in PassThrough.")
-
-def process_passthrough_emails(stats: Dict[str, int], config: Config) -> None:
-    with IMAPClient(config.passthrough_server, config.passthrough_port, config.passthrough_user, config.passthrough_pass, folder='INBOX') as passthrough:
-        if not passthrough.is_connected():
-            return
-            
+        Every message is decided on its own; the single EXPUNGE at the end is the
+        only moment at which anything is permanently removed."""
         try:
-            # Address messages by UID throughout: sequence numbers shift down
-            # whenever the mailbox is expunged, so a mid-loop expunge would leave
-            # the identifiers still queued here pointing at the wrong messages.
-            status, response = passthrough.execute('uid', 'SEARCH', None, 'ALL')
-            if status != 'OK':
-                logger.error("Failed to search PassThrough INBOX")
+            if not self._connect_passthrough():
                 return
-                
-            msg_uids = response[0].split()
-            if not msg_uids:
+
+            uids = self._waiting_uids()
+            if not uids:
                 return
-                
-            logger.debug(f"Found {len(msg_uids)} messages in PassThrough")
-            
-            with IMAPClient(config.gmail_server, config.gmail_port, config.gmail_user, config.gmail_pass, folder=None) as gmail:
-                with IMAPClient(config.notify_server, config.notify_port, config.notify_user, config.notify_pass, folder='INBOX') as notify_mail:
-                    for uid in msg_uids:
-                        try:
-                            process_single_message(passthrough, gmail, notify_mail, uid, stats, config)
-                        except Exception as e:
-                            logger.error(f"Error processing message UID {uid.decode('utf-8', errors='ignore')}: {e}")
-                    print(flush=True)
-                            
-                    try:
-                        passthrough.execute('expunge')
-                    except Exception as e:
-                        logger.error(f"Error expunging PassThrough INBOX: {e}")
-            
+
+            self._connect_gmail_and_notify()
+            for uid in uids:
+                try:
+                    self.handle_message(uid)
+                except Exception as e:
+                    logger.error(f"Error processing message UID {uid.decode('utf-8', errors='ignore')}: {e}")
+            print(flush=True)
+            self._expunge_passthrough()
         except Exception as e:
             logger.error(f"Error processing PassThrough: {e}")
+        finally:
+            self._close_all()
+
+    def handle_message(self, uid: bytes) -> None:
+        """Decide the fate of a single PassThrough message.
+
+        The delete at the bottom is only reachable down a path that has already
+        secured the message somewhere else. Every other path returns early and
+        leaves the original in PassThrough."""
+        message = self._read_headers(uid)
+        if message is None:
+            return
+
+        self.stats['checked'] += 1
+        print('.', end='', flush=True)
+
+        if message.message_id and self._gmail_has(message):
+            logger.debug(f"Message {message.message_id} found in GMail.")
+        else:
+            self._log_rescue_reason(message)
+
+            raw_email = self._fetch_raw(message)
+            if raw_email is None:
+                return  # unreadable -- leave the original in PassThrough
+
+            if not self._copy_to_notify(message, raw_email):
+                return  # secured nowhere -- leave the original in PassThrough
+            self.stats['notified'] += 1
+
+            if self.config.copy_to_gmail_inbox:
+                self._copy_to_gmail_inbox(message, raw_email)
+
+        self._mark_deleted(message)
+
+    # -- PassThrough --------------------------------------------------------
+
+    def _waiting_uids(self) -> List[bytes]:
+        """UIDs of everything sitting in the PassThrough INBOX."""
+        status, response = self.passthrough.execute('uid', 'SEARCH', None, 'ALL')
+        if status != 'OK':
+            logger.error("Failed to search PassThrough INBOX")
+            return []
+        uids = (response[0] or b'').split()
+        logger.debug(f"Found {len(uids)} messages in PassThrough")
+        return uids
+
+    def _read_headers(self, uid: bytes) -> Optional[Message]:
+        """Peek at the headers needed to identify a message, leaving it unread."""
+        status, data = self.passthrough.execute(
+            'uid', 'FETCH', uid, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])')
+        if status != 'OK' or not data or not data[0]:
+            logger.error(f"Failed to fetch header for message UID {uid.decode('utf-8', errors='ignore')}")
+            return None
+        return Message(uid=uid, **extract_message_details(data[0][1]))
+
+    def _fetch_raw(self, message: Message) -> Optional[bytes]:
+        """Pull a message's full body. One fetch serves every destination."""
+        status, data = self.passthrough.execute('uid', 'FETCH', message.uid, '(RFC822)')
+        if status != 'OK' or not data or not data[0]:
+            logger.error(f"Failed to fetch the body of message {message} from PassThrough. Leaving it to retry.")
+            return None
+        return data[0][1]
+
+    def _mark_deleted(self, message: Message) -> None:
+        """Flag the PassThrough original. The flag is persistent server-side, so
+        the message survives until run_once's closing EXPUNGE."""
+        self.passthrough.execute('uid', 'STORE', message.uid, '+FLAGS', '\\Deleted')
+        logger.debug(f"Marked message UID {message.uid_str} for deletion in PassThrough.")
+
+    def _expunge_passthrough(self) -> None:
+        try:
+            self.passthrough.execute('expunge')
+        except Exception as e:
+            logger.error(f"Error expunging PassThrough INBOX: {e}")
+
+    # -- GMail --------------------------------------------------------------
+
+    def _gmail_has(self, message: Message) -> bool:
+        """Has GMail already received this message?
+
+        Waits first. The GMail delivery and the PassThrough forward race each
+        other, so an immediate lookup reports mail that is merely still in flight
+        as missing. The NOOP holds the PassThrough session open across the wait."""
+        time.sleep(GMAIL_SETTLE_SECONDS)
+        try:
+            self.passthrough.execute('noop')
+        except Exception:
+            pass
+
+        if not self.gmail or not self.gmail.is_connected():
+            return False
+
+        try:
+            for folder in self._gmail_folders():
+                if not self._select_gmail_folder(folder):
+                    continue
+                for criteria in (('HEADER', 'Message-ID', message.message_id),
+                                 ('X-GM-RAW', f'rfc822msgid:{message.message_id}')):
+                    status, response = self.gmail.execute('search', None, *criteria)
+                    if status == 'OK' and response and response[0] and response[0].split():
+                        return True
+        except Exception as e:
+            logger.error(f"Error searching GMail for {message.message_id}: {e}")
+        return False
+
+    def _select_gmail_folder(self, folder: str) -> bool:
+        """Select a GMail folder read-only, falling back to INBOX for All Mail."""
+        status, response = self.gmail.select(folder, readonly=True)
+        if status == 'OK':
+            return True
+
+        logger.debug(f"Could not select folder ({folder}). Response: {response}.")
+        if folder != self._gmail_folders()[0]:
+            return False
+
+        logger.warning(f"Could not select All Mail folder ({folder}). Falling back to INBOX.")
+        status, _ = self.gmail.select('INBOX', readonly=True)
+        return status == 'OK'
+
+    def _gmail_folders(self) -> List[str]:
+        """All Mail, Spam and Trash, discovered from the server's LIST flags.
+
+        A forwarded message that GMail filed as spam or deleted still counts as
+        delivered, so all three are searched."""
+        if self._gmail_folder_cache:
+            return self._gmail_folder_cache
+
+        all_mail = '"[Gmail]/All Mail"'
+        spam = '"[Gmail]/Spam"'
+        trash = '"[Gmail]/Trash"'
+
+        try:
+            status, folders = self.gmail.execute('list')
+            if status == 'OK' and folders:
+                for folder_bytes in folders:
+                    if not folder_bytes:
+                        continue
+                    folder_str = folder_bytes.decode('utf-8', errors='ignore') if isinstance(folder_bytes, bytes) else str(folder_bytes)
+                    folder_lower = folder_str.lower()
+
+                    if '\\all' in folder_lower or '\\junk' in folder_lower or '\\spam' in folder_lower or '\\trash' in folder_lower:
+                        match = re.search(r'"([^"]+)"$', folder_str)
+                        if match:
+                            folder_name = f'"{match.group(1)}"'
+                        else:
+                            folder_name = folder_str.split()[-1]
+
+                        if '\\all' in folder_lower:
+                            all_mail = folder_name
+                        elif '\\junk' in folder_lower or '\\spam' in folder_lower:
+                            spam = folder_name
+                        elif '\\trash' in folder_lower:
+                            trash = folder_name
+        except Exception as e:
+            logger.error(f"Error querying folder list: {e}")
+
+        self._gmail_folder_cache = [all_mail, spam, trash]
+        return self._gmail_folder_cache
+
+    # -- Notify -------------------------------------------------------------
+
+    def _log_rescue_reason(self, message: Message) -> None:
+        """Say why this message is being copied out, before anything is copied."""
+        print(flush=True)  # close off the run of progress dots
+        if message.message_id:
+            logger.info(f"Message {message.message_id} NOT found in GMail (From: {message.sender}, Subject: {message.subject}). Copying to Notify...")
+        else:
+            logger.warning(f"Could not extract Message-ID from message {message}. Copying to Notify to be safe.")
+
+    def _copy_to_notify(self, message: Message, raw_email: bytes) -> bool:
+        """Secure a copy in Notify. This is the copy that counts.
+
+        Returns True only once the APPEND is confirmed -- that confirmation is
+        the single thing that makes deleting the PassThrough original safe."""
+        if not self._append(self.notify, raw_email):
+            logger.error(f"Failed to copy message {message} to Notify. Leaving it in PassThrough to retry.")
+            return False
+        return True
+
+    def _copy_to_gmail_inbox(self, message: Message, raw_email: bytes) -> None:
+        """Also drop a copy in the GMail Inbox, for COPY_TO_GMAIL_INBOX setups.
+
+        Best effort, and deliberately returns nothing: the message is already
+        safe in Notify, so a failure here is worth a warning but must not hold up
+        removing the PassThrough original."""
+        logger.debug(f"Also copying message {message} to GMail Inbox...")
+        if not self._append(self.gmail, raw_email):
+            logger.warning(f"Failed to copy message {message} to the GMail Inbox (it is backed up in Notify).")
+
+    @staticmethod
+    def _append(client: Optional[IMAPClient], raw_email: bytes, folder: str = 'INBOX') -> bool:
+        if not client or not client.is_connected():
+            return False
+        try:
+            status, _ = client.execute('append', folder, None, imaplib.Time2Internaldate(time.time()), raw_email)
+            return status == 'OK'
+        except Exception as e:
+            logger.error(f"Error copying message: {e}")
+            return False
+
+    # -- connections --------------------------------------------------------
+
+    def _connect_passthrough(self) -> bool:
+        """Open the PassThrough INBOX -- the only mailbox this service deletes from."""
+        cfg = self.config
+        self.passthrough = IMAPClient(cfg.passthrough_server, cfg.passthrough_port,
+                                      cfg.passthrough_user, cfg.passthrough_pass, folder='INBOX')
+        self.passthrough.connect()
+        return self.passthrough.is_connected()
+
+    def _connect_gmail_and_notify(self) -> None:
+        """Open the lookup and backup mailboxes.
+
+        Held back until PassThrough reports work, so an idle poll costs one login
+        rather than three. GMail opens with no folder because each lookup selects
+        All Mail, Spam or Trash for itself."""
+        cfg = self.config
+        self.gmail = IMAPClient(cfg.gmail_server, cfg.gmail_port,
+                                cfg.gmail_user, cfg.gmail_pass, folder=None)
+        self.gmail.connect()
+
+        self.notify = IMAPClient(cfg.notify_server, cfg.notify_port,
+                                 cfg.notify_user, cfg.notify_pass, folder='INBOX')
+        self.notify.connect()
+
+    def _close_all(self) -> None:
+        """Close whatever got opened. Safe on a client that never connected, and
+        safe to reach with GMail and Notify still unopened."""
+        for client in (self.notify, self.gmail, self.passthrough):
+            if client:
+                client.close()
+        self.passthrough = self.gmail = self.notify = None
 
 def main() -> None:
     config = load_config()
-    
+
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
-    
+
     logger.info("Starting Email Forward Fixer Service")
-    
+
     current_date = datetime.date.today()
     stats = {'checked': 0, 'notified': 0}
-    
+
     while not shutdown_event.is_set():
         today = datetime.date.today()
         if today > current_date:
@@ -443,12 +543,12 @@ def main() -> None:
             logger.info(f"Daily Summary: {stats['checked']} messages checked, {stats['notified']} notified.")
             stats = {'checked': 0, 'notified': 0}
             current_date = today
-            
+
         try:
-            process_passthrough_emails(stats, config)
+            ForwardFixer(config, stats).run_once()
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}")
-            
+
         shutdown_event.wait(config.check_interval)
 
 if __name__ == "__main__":

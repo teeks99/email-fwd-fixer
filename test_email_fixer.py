@@ -40,15 +40,17 @@ class TestEmailFixer(unittest.TestCase):
     HEADER_WITHOUT_ID = b"From: sender@test.com\r\nSubject: Hello\r\n"
 
     @staticmethod
-    def make_passthrough(header, fetch_full=('OK', [(None, b"full raw email content")]), noop=True):
+    def make_passthrough(header, fetch_full=('OK', [(None, b"full raw email content")])):
+        """A PassThrough whose replies depend on the command, not on call order."""
         from unittest.mock import MagicMock
+
+        def respond(*args, **kwargs):
+            if args[:2] == ('uid', 'FETCH'):
+                return ('OK', [(None, header)]) if 'HEADER.FIELDS' in args[3] else fetch_full
+            return ('OK', [b''])
+
         mock_passthrough = MagicMock()
-        responses = [('OK', [(None, header)])]
-        if noop:
-            responses.append(('OK', [b'']))
-        responses.append(fetch_full)
-        responses.append(('OK', [b'']))
-        mock_passthrough.execute.side_effect = responses
+        mock_passthrough.execute.side_effect = respond
         return mock_passthrough
 
     @staticmethod
@@ -58,35 +60,41 @@ class TestEmailFixer(unittest.TestCase):
             for call in mock_passthrough.execute.call_args_list
         )
 
-    def run_process(self, mock_passthrough, mock_notify, found_in_gmail=False, config=None, stats=None):
-        from unittest.mock import MagicMock, patch
-        from email_fixer import process_single_message, Config
+    def make_fixer(self, mock_passthrough, mock_notify, mock_gmail=None, config=None, stats=None):
+        from unittest.mock import MagicMock
+        from email_fixer import ForwardFixer, Config
 
         config = config or Config(300, False, "", 993, "", "", "", 993, "", "", "", 993, "", "")
-        stats = stats if stats is not None else {'checked': 0, 'notified': 0}
-        with patch('email_fixer.check_gmail_for_message', return_value=found_in_gmail), \
-             patch('email_fixer.time.sleep'):
-            process_single_message(mock_passthrough, MagicMock(), mock_notify, b'1', stats, config)
-        return stats
+        fixer = ForwardFixer(config, stats if stats is not None else {'checked': 0, 'notified': 0})
+        fixer.passthrough = mock_passthrough
+        fixer.gmail = mock_gmail if mock_gmail is not None else MagicMock()
+        fixer.notify = mock_notify
+        return fixer
 
-    def test_process_single_message_not_found_logging(self):
-        from unittest.mock import MagicMock, patch
-        from email_fixer import process_single_message, Config, logger
+    def run_handle(self, mock_passthrough, mock_notify, found_in_gmail=False,
+                   mock_gmail=None, config=None, stats=None):
+        from unittest.mock import patch
+        from email_fixer import ForwardFixer
+
+        fixer = self.make_fixer(mock_passthrough, mock_notify, mock_gmail, config, stats)
+        with patch.object(ForwardFixer, '_gmail_has', return_value=found_in_gmail):
+            fixer.handle_message(b'1')
+        return fixer.stats
+
+    def test_handle_message_not_found_logging(self):
+        from unittest.mock import MagicMock
+        from email_fixer import logger
 
         mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID)
-        mock_gmail = MagicMock()
         mock_notify = MagicMock()
         mock_notify.execute.return_value = ('OK', [b'[APPENDUID 1 1] Append completed'])
-        config = Config(300, False, "", 993, "", "", "", 993, "", "", "", 993, "", "")
-        stats = {'checked': 0, 'notified': 0}
 
-        with patch('email_fixer.check_gmail_for_message', return_value=False), \
-             patch('email_fixer.time.sleep'), \
-             self.assertLogs(logger, level='INFO') as log_cm:
-            process_single_message(mock_passthrough, mock_gmail, mock_notify, b'1', stats, config)
-            self.assertTrue(any("Message <test1234@example.com> NOT found in GMail" in msg for msg in log_cm.output))
+        with self.assertLogs(logger, level='INFO') as log_cm:
+            stats = self.run_handle(mock_passthrough, mock_notify)
+        self.assertTrue(any("Message <test1234@example.com> NOT found in GMail" in msg for msg in log_cm.output))
 
         self.assertEqual(stats['notified'], 1)
+        self.assertEqual(stats['checked'], 1)
         self.assertTrue(self.deleted(mock_passthrough))
 
     def test_found_in_gmail_is_deleted_without_copying(self):
@@ -94,7 +102,7 @@ class TestEmailFixer(unittest.TestCase):
 
         mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID, fetch_full=('OK', [b'']))
         mock_notify = MagicMock()
-        stats = self.run_process(mock_passthrough, mock_notify, found_in_gmail=True)
+        stats = self.run_handle(mock_passthrough, mock_notify, found_in_gmail=True)
 
         mock_notify.execute.assert_not_called()
         self.assertEqual(stats['notified'], 0)
@@ -106,7 +114,7 @@ class TestEmailFixer(unittest.TestCase):
         mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID)
         mock_notify = MagicMock()
         mock_notify.execute.return_value = ('NO', [b'Over quota'])
-        stats = self.run_process(mock_passthrough, mock_notify)
+        stats = self.run_handle(mock_passthrough, mock_notify)
 
         self.assertFalse(self.deleted(mock_passthrough))
         self.assertEqual(stats['notified'], 0)
@@ -117,19 +125,29 @@ class TestEmailFixer(unittest.TestCase):
         mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID, fetch_full=('NO', [None]))
         mock_notify = MagicMock()
         mock_notify.execute.return_value = ('OK', [b''])
-        stats = self.run_process(mock_passthrough, mock_notify)
+        stats = self.run_handle(mock_passthrough, mock_notify)
 
         mock_notify.execute.assert_not_called()
         self.assertFalse(self.deleted(mock_passthrough))
         self.assertEqual(stats['notified'], 0)
 
+    def test_not_deleted_when_header_fetch_fails(self):
+        from unittest.mock import MagicMock
+
+        mock_passthrough = MagicMock()
+        mock_passthrough.execute.return_value = ('NO', [None])
+        stats = self.run_handle(mock_passthrough, MagicMock())
+
+        self.assertFalse(self.deleted(mock_passthrough))
+        self.assertEqual(stats, {'checked': 0, 'notified': 0})
+
     def test_missing_message_id_not_deleted_when_copy_fails(self):
         from unittest.mock import MagicMock
 
-        mock_passthrough = self.make_passthrough(self.HEADER_WITHOUT_ID, noop=False)
+        mock_passthrough = self.make_passthrough(self.HEADER_WITHOUT_ID)
         mock_notify = MagicMock()
         mock_notify.execute.return_value = ('NO', [b'Over quota'])
-        stats = self.run_process(mock_passthrough, mock_notify)
+        stats = self.run_handle(mock_passthrough, mock_notify)
 
         self.assertFalse(self.deleted(mock_passthrough))
         self.assertEqual(stats['notified'], 0)
@@ -137,13 +155,28 @@ class TestEmailFixer(unittest.TestCase):
     def test_missing_message_id_deleted_once_copied(self):
         from unittest.mock import MagicMock
 
-        mock_passthrough = self.make_passthrough(self.HEADER_WITHOUT_ID, noop=False)
+        mock_passthrough = self.make_passthrough(self.HEADER_WITHOUT_ID)
         mock_notify = MagicMock()
         mock_notify.execute.return_value = ('OK', [b''])
-        stats = self.run_process(mock_passthrough, mock_notify)
+        stats = self.run_handle(mock_passthrough, mock_notify)
 
         self.assertTrue(self.deleted(mock_passthrough))
         self.assertEqual(stats['notified'], 1)
+
+    def test_missing_message_id_skips_the_gmail_lookup(self):
+        """No Message-ID means nothing to search for -- copy it and move on."""
+        from unittest.mock import MagicMock, patch
+        from email_fixer import ForwardFixer
+
+        mock_notify = MagicMock()
+        mock_notify.execute.return_value = ('OK', [b''])
+        fixer = self.make_fixer(self.make_passthrough(self.HEADER_WITHOUT_ID), mock_notify)
+
+        with patch.object(ForwardFixer, '_gmail_has') as mock_lookup:
+            fixer.handle_message(b'1')
+
+        mock_lookup.assert_not_called()
+        self.assertEqual(fixer.stats['notified'], 1)
 
     def test_gmail_inbox_copy_failure_still_deletes(self):
         from unittest.mock import MagicMock
@@ -155,16 +188,62 @@ class TestEmailFixer(unittest.TestCase):
         mock_gmail = MagicMock()
         mock_gmail.execute.return_value = ('NO', [b'Over quota'])
         config = Config(300, True, "", 993, "", "", "", 993, "", "", "", 993, "", "")
-        stats = {'checked': 0, 'notified': 0}
-
-        from unittest.mock import patch
-        from email_fixer import process_single_message
-        with patch('email_fixer.check_gmail_for_message', return_value=False), \
-             patch('email_fixer.time.sleep'):
-            process_single_message(mock_passthrough, mock_gmail, mock_notify, b'1', stats, config)
+        stats = self.run_handle(mock_passthrough, mock_notify, mock_gmail=mock_gmail, config=config)
 
         self.assertTrue(self.deleted(mock_passthrough))
         self.assertEqual(stats['notified'], 1)
+
+    def test_gmail_inbox_copy_reuses_the_single_body_fetch(self):
+        """Both destinations share one FETCH -- splitting the copies must not
+        turn into fetching the same message once per destination."""
+        from unittest.mock import MagicMock
+        from email_fixer import Config
+
+        mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID)
+        mock_notify = MagicMock()
+        mock_notify.execute.return_value = ('OK', [b''])
+        mock_gmail = MagicMock()
+        mock_gmail.execute.return_value = ('OK', [b''])
+        config = Config(300, True, "", 993, "", "", "", 993, "", "", "", 993, "", "")
+        self.run_handle(mock_passthrough, mock_notify, mock_gmail=mock_gmail, config=config)
+
+        body_fetches = [c for c in mock_passthrough.execute.call_args_list
+                        if c.args[:2] == ('uid', 'FETCH') and c.args[3] == '(RFC822)']
+        self.assertEqual(1, len(body_fetches))
+
+        notified = [c.args[4] for c in mock_notify.execute.call_args_list if c.args[0] == 'append']
+        mirrored = [c.args[4] for c in mock_gmail.execute.call_args_list if c.args[0] == 'append']
+        self.assertEqual([b"full raw email content"], notified)
+        self.assertEqual(notified, mirrored)
+
+    def test_no_gmail_inbox_copy_when_not_configured(self):
+        from unittest.mock import MagicMock
+
+        mock_notify = MagicMock()
+        mock_notify.execute.return_value = ('OK', [b''])
+        mock_gmail = MagicMock()
+        stats = self.run_handle(self.make_passthrough(self.HEADER_WITH_ID), mock_notify,
+                                mock_gmail=mock_gmail)
+
+        mock_gmail.execute.assert_not_called()
+        self.assertEqual(stats['notified'], 1)
+
+    def test_no_gmail_inbox_copy_when_notify_copy_failed(self):
+        """The GMail Inbox copy is a mirror of a secured message, so it must not
+        happen for a message that was never secured."""
+        from unittest.mock import MagicMock
+        from email_fixer import Config
+
+        mock_notify = MagicMock()
+        mock_notify.execute.return_value = ('NO', [b'Over quota'])
+        mock_gmail = MagicMock()
+        config = Config(300, True, "", 993, "", "", "", 993, "", "", "", 993, "", "")
+        mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID)
+        stats = self.run_handle(mock_passthrough, mock_notify, mock_gmail=mock_gmail, config=config)
+
+        mock_gmail.execute.assert_not_called()
+        self.assertFalse(self.deleted(mock_passthrough))
+        self.assertEqual(stats['notified'], 0)
 
     def test_passthrough_addresses_messages_by_uid(self):
         from unittest.mock import MagicMock
@@ -172,7 +251,7 @@ class TestEmailFixer(unittest.TestCase):
         mock_passthrough = self.make_passthrough(self.HEADER_WITH_ID)
         mock_notify = MagicMock()
         mock_notify.execute.return_value = ('OK', [b''])
-        self.run_process(mock_passthrough, mock_notify)
+        self.run_handle(mock_passthrough, mock_notify)
 
         calls = [call.args for call in mock_passthrough.execute.call_args_list]
         self.assertIn(('uid', 'FETCH', b'1', '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT)])'), calls)
@@ -181,9 +260,9 @@ class TestEmailFixer(unittest.TestCase):
         # Nothing may address a message by sequence number, which shifts on expunge.
         self.assertEqual([], [c for c in calls if c[0] in ('fetch', 'store', 'search')])
 
-    def test_process_passthrough_emails_searches_by_uid(self):
+    def test_run_once_searches_by_uid(self):
         from unittest.mock import MagicMock, patch
-        from email_fixer import process_passthrough_emails, Config
+        from email_fixer import ForwardFixer, Config
 
         passthrough = MagicMock()
         passthrough.is_connected.return_value = True
@@ -191,10 +270,120 @@ class TestEmailFixer(unittest.TestCase):
         config = Config(300, False, "imap.test", 993, "u", "p", "", 993, "", "", "", 993, "", "")
 
         with patch('email_fixer.IMAPClient') as mock_cls:
-            mock_cls.return_value.__enter__.return_value = passthrough
-            process_passthrough_emails({'checked': 0, 'notified': 0}, config)
+            mock_cls.return_value = passthrough
+            ForwardFixer(config, {'checked': 0, 'notified': 0}).run_once()
 
         passthrough.execute.assert_called_once_with('uid', 'SEARCH', None, 'ALL')
+
+    def test_run_once_handles_every_uid_then_expunges_once(self):
+        from unittest.mock import MagicMock, call, patch
+        from email_fixer import ForwardFixer, Config
+
+        passthrough = MagicMock()
+        passthrough.is_connected.return_value = True
+        passthrough.execute.return_value = ('OK', [b'3 7 11'])
+        config = Config(300, False, "imap.test", 993, "u", "p", "", 993, "", "", "", 993, "", "")
+        fixer = ForwardFixer(config, {'checked': 0, 'notified': 0})
+
+        with patch('email_fixer.IMAPClient') as mock_cls, \
+             patch.object(ForwardFixer, 'handle_message') as mock_handle, \
+             patch.object(ForwardFixer, '_expunge_passthrough') as mock_expunge:
+            mock_cls.return_value = passthrough
+            fixer.run_once()
+
+        self.assertEqual([call(b'3'), call(b'7'), call(b'11')], mock_handle.call_args_list)
+        mock_expunge.assert_called_once()
+
+    def test_run_once_keeps_going_when_one_message_raises(self):
+        from unittest.mock import MagicMock, patch
+        from email_fixer import ForwardFixer, Config
+
+        passthrough = MagicMock()
+        passthrough.is_connected.return_value = True
+        passthrough.execute.return_value = ('OK', [b'1 2 3'])
+        config = Config(300, False, "imap.test", 993, "u", "p", "", 993, "", "", "", 993, "", "")
+        fixer = ForwardFixer(config, {'checked': 0, 'notified': 0})
+
+        with patch('email_fixer.IMAPClient') as mock_cls, \
+             patch.object(ForwardFixer, 'handle_message', side_effect=[None, RuntimeError('boom'), None]) as mock_handle, \
+             patch.object(ForwardFixer, '_expunge_passthrough') as mock_expunge:
+            mock_cls.return_value = passthrough
+            fixer.run_once()
+
+        self.assertEqual(3, mock_handle.call_count)
+        mock_expunge.assert_called_once()
+
+    def test_run_once_skips_gmail_and_notify_when_passthrough_is_empty(self):
+        """An idle poll should cost one login, not three."""
+        from unittest.mock import MagicMock, patch
+        from email_fixer import ForwardFixer, Config
+
+        passthrough = MagicMock()
+        passthrough.is_connected.return_value = True
+        passthrough.execute.return_value = ('OK', [b''])
+        config = Config(300, False, "imap.test", 993, "u", "p", "", 993, "", "", "", 993, "", "")
+
+        with patch('email_fixer.IMAPClient') as mock_cls:
+            mock_cls.return_value = passthrough
+            ForwardFixer(config, {'checked': 0, 'notified': 0}).run_once()
+
+        self.assertEqual(1, mock_cls.call_count)
+
+    def test_run_once_closes_every_connection_it_opened(self):
+        from unittest.mock import MagicMock, patch
+        from email_fixer import ForwardFixer, Config
+
+        clients = []
+
+        def make_client(*args, **kwargs):
+            client = MagicMock()
+            client.is_connected.return_value = True
+            client.execute.return_value = ('OK', [b'1'])
+            clients.append(client)
+            return client
+
+        config = Config(300, False, "imap.test", 993, "u", "p", "gm", 993, "u", "p", "nt", 993, "u", "p")
+        with patch('email_fixer.IMAPClient', side_effect=make_client), \
+             patch.object(ForwardFixer, 'handle_message'):
+            ForwardFixer(config, {'checked': 0, 'notified': 0}).run_once()
+
+        self.assertEqual(3, len(clients))
+        for client in clients:
+            client.close.assert_called_once()
+
+    def test_run_once_closes_connections_when_the_pass_fails(self):
+        """try/finally, not the happy path, is what guarantees teardown."""
+        from unittest.mock import MagicMock, patch
+        from email_fixer import ForwardFixer, Config, logger
+
+        passthrough = MagicMock()
+        passthrough.is_connected.return_value = True
+        passthrough.execute.side_effect = RuntimeError('server exploded')
+        config = Config(300, False, "imap.test", 993, "u", "p", "", 993, "", "", "", 993, "", "")
+
+        with patch('email_fixer.IMAPClient') as mock_cls, \
+             self.assertLogs(logger, level='ERROR') as log_cm:
+            mock_cls.return_value = passthrough
+            ForwardFixer(config, {'checked': 0, 'notified': 0}).run_once()
+
+        passthrough.close.assert_called_once()
+        self.assertTrue(any("Error processing PassThrough" in msg for msg in log_cm.output))
+
+    def test_run_once_closes_passthrough_when_login_fails(self):
+        from unittest.mock import MagicMock, patch
+        from email_fixer import ForwardFixer, Config
+
+        passthrough = MagicMock()
+        passthrough.is_connected.return_value = False
+        config = Config(300, False, "imap.test", 993, "u", "p", "", 993, "", "", "", 993, "", "")
+
+        with patch('email_fixer.IMAPClient') as mock_cls:
+            mock_cls.return_value = passthrough
+            ForwardFixer(config, {'checked': 0, 'notified': 0}).run_once()
+
+        self.assertEqual(1, mock_cls.call_count)
+        passthrough.close.assert_called_once()
+        passthrough.execute.assert_not_called()
 
     @staticmethod
     def stale_and_fresh():
