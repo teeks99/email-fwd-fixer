@@ -2,6 +2,7 @@ import imaplib
 import email
 from email.header import decode_header, make_header
 import os
+import sys
 import time
 import logging
 import signal
@@ -30,6 +31,40 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Progress dots are written straight to stdout, one unterminated write each, so
+# they only read as a single line where something redraws a terminal. 
+PROGRESS_IS_LIVE = sys.stdout.isatty()
+
+class Progress:
+    """The run of progress dots for one poll cycle -- one dot per message."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def tick(self) -> None:
+        self.count += 1
+        if PROGRESS_IS_LIVE:
+            print('.', end='', flush=True)
+
+    def break_line(self) -> None:
+        """Close off the dots so a log line lands on a clean row.
+
+        Only a terminal needs this. Off one, the dots have not been written yet,
+        and breaking the run there is what would put each dot on its own line."""
+        if PROGRESS_IS_LIVE and self.count:
+            print(flush=True)
+            self.count = 0
+
+    def done(self) -> None:
+        """End of cycle: release whatever the run of dots still holds."""
+        if not self.count:
+            return
+        if PROGRESS_IS_LIVE:
+            print(flush=True)
+        else:
+            logger.info(f"Checked {self.count} message{'' if self.count == 1 else 's'}: {'.' * self.count}")
+        self.count = 0
 
 @dataclass
 class Config:
@@ -266,6 +301,7 @@ class ForwardFixer:
         self.gmail: Optional[IMAPClient] = None
         self.notify: Optional[IMAPClient] = None
         self._gmail_folder_cache: Optional[List[str]] = None
+        self.progress = Progress()
 
     # -- the policy ---------------------------------------------------------
 
@@ -288,7 +324,7 @@ class ForwardFixer:
                     self.handle_message(uid)
                 except Exception as e:
                     logger.error(f"Error processing message UID {uid.decode('utf-8', errors='ignore')}: {e}")
-            print(flush=True)
+            self.progress.done()
             self._expunge_passthrough()
         except Exception as e:
             logger.error(f"Error processing PassThrough: {e}")
@@ -306,7 +342,7 @@ class ForwardFixer:
             return
 
         self.stats['checked'] += 1
-        print('.', end='', flush=True)
+        self.progress.tick()
 
         if message.message_id and self._gmail_has(message):
             logger.debug(f"Message {message.message_id} found in GMail.")
@@ -455,7 +491,7 @@ class ForwardFixer:
 
     def _log_rescue_reason(self, message: Message) -> None:
         """Say why this message is being copied out, before anything is copied."""
-        print(flush=True)  # close off the run of progress dots
+        self.progress.break_line()
         if message.message_id:
             logger.info(f"Message {message.message_id} NOT found in GMail (From: {message.sender}, Subject: {message.subject}). Copying to Notify...")
         else:
@@ -539,7 +575,6 @@ def main() -> None:
     while not shutdown_event.is_set():
         today = datetime.date.today()
         if today > current_date:
-            print()
             logger.info(f"Daily Summary: {stats['checked']} messages checked, {stats['notified']} notified.")
             stats = {'checked': 0, 'notified': 0}
             current_date = today
