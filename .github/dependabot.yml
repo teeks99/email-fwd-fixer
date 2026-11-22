@@ -1,0 +1,22 @@
+# Weekly PRs for new versions of this project's dependencies. Each PR's branch
+# is built and tested by docker-publish.yml without pushing an image; merging
+# the PR into main publishes as usual.
+version: 2
+updates:
+  - package-ecosystem: "pip" # requirements.txt
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker" # FROM line in the Dockerfile
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions" # uses: lines in .github/workflows
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions: # one PR for all action updates
+        patterns: ["*"]
